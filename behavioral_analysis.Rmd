@@ -1,0 +1,253 @@
+---
+title: "behavioral_analysis"
+author: "Theresa Menna"
+date: "2025-12-15"
+output: word_document
+---
+
+```{r load_data, echo=TRUE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+setwd("C:/Users/Theresa Menna/Documents/Fritz Lab/QTL/behavioral_analysis/")
+
+
+grandparents <- read.table("QTL_Grandparent_responses.txt", header = TRUE, sep = "\t")
+
+gp_processed <- grandparents %>%
+  select(Group = Strain, NR, Human, Chick, HumHost, ChickHost, Hand)
+
+
+offspring <- read.table("QTL_Offspring_responses.txt", header = TRUE, sep = "\t")
+
+offspring_processed <- offspring %>%
+  select(Group = `FamID.2`, NR, Human, Chick, HumHost, ChickHost, Hand)
+offspring_processed$Group[grepl("F1", offspring_processed$Group)] <- "F2s" #rename offspring accurately
+# Rename groups in the grandparents dataframe
+gp_processed$Group[gp_processed$Group == "Cal1"] <- "BG1_Grandparents"
+gp_processed$Group[gp_processed$Group == "Evanston"] <- "AG2_Grandparents"
+
+# Rename the backcross group in the offspring dataframe
+offspring_processed$Group[offspring_processed$Group == "BcEv"] <- "BCs"
+
+```
+
+```{r GLM_setup, echo=FALSE}
+
+#Three tables:
+# 1. gp_pivot = only grandparents Cal1 and Evanston
+# 2. offspring_pivtot = only F2 and BcEv
+# 3. full_set = combined granparents and offspring in one table
+
+# Bootstrapping function --------------------------------------------------
+boot.fn <- function(x, N=5000) {
+  Int.1 <- replicate(N, mean(sample(x, size= length(x), replace=T)))
+  Int.CI <- quantile(Int.1, probs=c(0.025,0.975))
+  Int.CI
+}
+
+#Loading libraries
+library(lme4); library(lmtest); library(emmeans)
+
+# ----- Grandparents ---------
+gp_pivot <- gp_processed %>%
+  pivot_longer(
+    cols = NR:Chick,
+    names_to = "Choice",
+    values_to = "Count"
+  ) %>%
+  uncount(Count) %>%
+  mutate(Choice = tolower(Choice))
+
+# How to handle trials with multiple chicks? (only applies to gp, not offspring)
+# For now, let's try removing and treating as missing...
+gp_pivot <- gp_pivot %>%
+  mutate(
+    ChickHost = case_when(
+      grepl(",", ChickHost) ~ NA_character_,
+      ChickHost == "NN"     ~ "N", # Based on what Anastasia told me, NN = N
+      TRUE                  ~ ChickHost
+    )
+  )
+
+# ----- Offspring ---------
+offspring_pivot <- offspring_processed %>%
+  pivot_longer(
+    cols = NR:Chick,
+    names_to = "Choice",
+    values_to = "Count"
+  ) %>%
+  uncount(Count) %>%
+  mutate(Choice = tolower(Choice))
+
+
+full_set <- bind_rows(gp_pivot, offspring_pivot)
+
+```
+
+```{r GLM_acceptance_of_host, echo=FALSE}
+
+#####################################################################
+#(1) acceptance of either host during day 1
+#####################################################################
+
+#recode host response - all nr values as 0 and c/h as a 1
+full_set$Response <- as.factor(ifelse(full_set$Choice == "nr", 0, 1))
+
+# Should human host be a fixed effect or random effect?
+m_rand <- glmer(Response ~ Group + Hand + (1 | ChickHost) + (1 | HumHost), family = binomial, data = full_set)
+isSingular(m_rand) # TRUE
+VarCorr(m_rand) #human host should be a fixed effect variable (only 2 of them; st.dev is ~0)
+
+# Now test if genetic background has an effect on probability of responding
+model_full <- glmer(Response ~ 1 + Group + Hand + HumHost + (1|ChickHost), data = full_set, 
+                    family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+model_red1 <- glmer(Response ~ 1 + Hand + HumHost + (1|ChickHost), data = full_set, 
+                    family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+lrtest(model_red1, model_full) #it does! (p=0.01755)
+
+# Can we simplify the model?
+model_red2 <- glmer(Response ~ 1 + Group + HumHost + (1|ChickHost), data = full_set, 
+                    family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+lrtest(model_red2, model_full) # minus hand: p=0.7294
+
+model_red3 <- glmer(Response ~ 1 + Group + Hand + (1|ChickHost), data = full_set, 
+                    family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+lrtest(model_red3, model_full) # minus HumHost: p=0.205
+
+model_red4 <- glmer(Response ~ 1 + Group + (1|ChickHost), data = full_set, 
+                    family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+lrtest(model_red4, model_full) # minus Hand and HumHost: p=0.3623
+
+# Result: No obvious need to include Hand or Human Host in the model. Continue with model_red4.
+# Which groups differ from each other?
+summary(model_red4)
+emmeans(model_red4, pairwise ~ Group)
+
+#################For final analysis:
+model_red4 <- glmer(Response ~ 1 + Group + (1|ChickHost), data = full_set, 
+                    family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+model_red5 <- glmer(Response ~ 1 + (1|ChickHost), data = full_set, 
+                    family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+lrtest(model_red5, model_red4) #p = 0.004849
+
+# averages with 95% confidence intervals
+full_set$ResponseNum <- as.numeric(as.character(full_set$Response)) # was previously a factor
+mean_day1_resp <- tapply(full_set$ResponseNum, full_set$Group, mean)
+mean_day1_resp
+
+boot_day1_resp <- tapply(full_set$ResponseNum, full_set$Group, boot.fn)
+boot_day1_resp
+
+```
+
+```{r GLM_human_host_preference, echo=FALSE}
+
+#####################################################################
+#(2) selection/preference for a human host
+#####################################################################
+
+#Setting up the dataset
+#data for individuals that failed to respond on multiple days were removed from the dataset (all 'nr' values removed)
+resp_only_full_set <- subset(full_set, Choice != "nr")
+head(resp_only_full_set)
+sum(resp_only_full_set$Choice!= "nr")
+
+#For this model, a host selection of the ‘human’ host was given a value of 1, and selection of a ‘chick’ host a 0.
+#recoding the host choices to make binary variable
+resp_only_full_set$host_hum <- ifelse(resp_only_full_set$Choice == "chick", 0, 1)
+
+# testing models with and without Group
+model_full_final <- glmer(host_hum ~ 1 + Group + (1|ChickHost), data = resp_only_full_set, 
+                          family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+model_red <- glmer(host_hum ~ 1 + (1|ChickHost), data = resp_only_full_set, 
+                   family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+lrtest(model_red, model_full_final) # p < 2.2e-16 ***
+
+# Which groups differ from each other?
+summary(model_full_final)
+emmeans(model_full_final, pairwise ~ Group)
+
+# averages with 95% confidence intervals
+mean_host_hum <- tapply(resp_only_full_set$host_hum, resp_only_full_set$Group, mean)
+mean_host_hum
+
+boot_host_hum <- tapply(resp_only_full_set$host_hum, resp_only_full_set$Group, boot.fn)
+boot_host_hum
+
+```
+
+```{r GLM_graphs, echo=FALSE}
+
+# --- shared graph settings ---
+my_colors <- c(
+  "BG1_Grandparents" = "#E57373",      # Muted red
+  "AG2_Grandparents" = "#64B5F6",  # Blue
+  "F2s" = "#BA68C8",        # Lighter purple
+  "BCs" = "#7E57C2"       # Deeper purple
+)
+
+desired_order <- c("BG1_Grandparents", "F2s", "BCs", "AG2_Grandparents")
+
+# --- Plotting response rate on day 1 ---
+
+response_df <- as.data.frame(bind_rows(boot_day1_resp$AG2_Grandparents, boot_day1_resp$BCs, boot_day1_resp$BG1_Grandparents, boot_day1_resp$F2s))
+rownames(response_df) <- rownames(mean_day1_resp) # careful that these are in the right order!!
+response_rate <- cbind(as.data.frame(mean_day1_resp), response_df) # again, careful these are in the right order!!
+response_rate$Group <- rownames(response_rate)
+
+#Set desired order on x-axis
+response_rate$Group <- factor(response_rate$Group, levels = desired_order)
+
+#plot
+plot1 <- ggplot(response_rate, aes(x = Group, y = mean_day1_resp, fill = Group)) +
+  geom_col(width = 0.7) +
+  geom_errorbar(aes(ymin = `2.5%`, ymax = `97.5%`), width = 0.2, linewidth = 0.8) +
+  geom_text(aes(label = round(mean_day1_resp, 3)), vjust = 5, size = 4) +
+  scale_fill_manual(values = my_colors) + # Use the custom colors
+  labs(
+    y = "Proportion Responded"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none") +
+  ylim(0, 1)
+
+print(plot1)
+ggsave("behavioral-assay_Response-Rate.png", plot = plot1, dpi = 500)
+
+
+# --- Plotting human host preference among responders ---
+
+# data wrangling
+host_hum_boot_df <- as.data.frame(bind_rows(boot_host_hum$AG2_Grandparents, boot_host_hum$BCs, boot_host_hum$BG1_Grandparents, boot_host_hum$F2s))
+rownames(host_hum_boot_df) <- rownames(mean_host_hum) # careful that these are in the right order!!
+host_hum_preference <- cbind(as.data.frame(mean_host_hum), host_hum_boot_df) # again, careful these are in the right order!!
+host_hum_preference$Group <- rownames(host_hum_preference)
+
+#Set desired order on x-axis
+host_hum_preference$Group <- factor(host_hum_preference$Group, levels = desired_order)
+
+#plot
+plot2 <- ggplot(host_hum_preference, aes(x = Group, y = mean_host_hum, fill = Group)) +
+  geom_col(width = 0.7) +
+  geom_errorbar(aes(ymin = `2.5%`, ymax = `97.5%`), width = 0.2, linewidth = 0.8) +
+  geom_text(aes(label = round(mean_host_hum, 3)), vjust = 5, size = 4) +
+  scale_fill_manual(values = my_colors) + # Use the same custom colors
+  labs(
+    y = "Proportion Responders Choosing Human"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none") +
+  ylim(0, 1)
+
+print(plot2)
+ggsave("behavioral-assay_Human-Preference.png", plot = plot2, dpi = 500)
+
+```

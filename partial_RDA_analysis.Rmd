@@ -1,0 +1,878 @@
+---
+title: "partial-RDA"
+author: "Theresa Menna"
+date: "2026-01-14"
+output: word_document
+---
+
+```{r general_setup, include=FALSE}
+library(vcfR)
+library(stringr)
+library(vegan)
+require(ggplot2)
+require(grid)
+library(dplyr)
+library(tidyverse)
+library(GenomicRanges)
+library(ggrepel)
+
+setwd(dir = "C:/Users/Theresa Menna/Documents/Fritz Lab/QTL/scripts_from_kate/")
+
+#Load in metadata for later, both full (metadata) set and F2s+BCs only (metadata_sub)
+metadata <- read.csv("QTL_metadata.csv",row.names = 1, header=TRUE, sep=",")
+keep <- str_count(rownames(metadata), "-") >= 3
+metadata_sub <- metadata[keep, ]
+
+```
+
+```{r GT_extraction, echo=FALSE}
+
+# Read in vcf and create unique loci IDs "CHROM:POS"
+vcf <- read.vcfR("./hostprefQTL-QuinqsT.filtered-variants.vcf.recode.vcf")
+locus_ids <- paste(
+  vcf@fix[,"CHROM"],
+  vcf@fix[,"POS"],
+  sep = ":"
+)
+
+# Extract just GT strings and change to pseudo allele counts
+gt <- extract.gt(vcf, element = "GT")
+
+gt_num <- matrix(NA_real_, nrow=nrow(gt), ncol=ncol(gt))
+
+gt_num[gt == "0/0"] <- 0
+gt_num[gt %in% c("0/1", "1/0")] <- 1
+gt_num[gt == "1/1"] <- 2
+
+# Transform to row = individuals, cols = loci
+geno_mat <- t(gt_num)
+
+# Name rows and cols correctly
+colnames(geno_mat) <- locus_ids
+rownames(geno_mat) <- colnames(gt)
+
+geno_df <- data.frame(
+  geno_mat,
+  check.names = FALSE
+)
+
+```
+
+```{r PCA-on-LD-pruned-SNPs, echo=FALSE}
+
+# Read in the LD pruned data (~7000 SNPs instead of ~26,000) -- from bash script "LD_prune.sh"
+geno_raw <- read.table("hostpref_PCA_ready.raw", header = TRUE, stringsAsFactors = FALSE)
+
+# Clean data and keep only genotypes (first 6 columns are PLINK metadata (FID, IID, PAT, MAT, SEX, PHENOTYPE)
+geno_data <- geno_raw[, -(1:6)]
+
+# Set row names to the individual IDs (IID is usually column 2)
+rownames(geno_data) <- geno_raw[, 2]
+
+# Now that missing values are filled in, remove F0s and F1s
+keep <- str_count(rownames(geno_data), "-") >= 3
+geno_data <- geno_data[keep, ]
+
+# Handle Missing Data (NA) -- though we did not retain any SNPs with >20% missingness,
+# vegan's rda() will fail if there are ANY NAs.
+# So any remaining NAs were replace with the mean genotype at that position.
+
+geno_imputed <- apply(geno_data, 2, function(x) {
+  x[is.na(x)] <- mean(x, na.rm = TRUE)
+  return(x)
+})
+
+# Check that row orders for genotype and phenotype matrices match!
+common_ids <- intersect(rownames(geno_imputed), rownames(metadata_sub))
+geno_matrix <- geno_imputed[common_ids, ]
+
+pheno_df <- metadata_sub[common_ids, ] # renamed metadata_sub to pheno_df
+
+# PCA on ancestry, note that scale=TRUE here.
+pca_ancestry <- rda(geno_imputed, scale = TRUE)
+
+# Grab eigenvals and calculate % variation for each PC and create labels
+eig <- eigenvals(pca_ancestry)
+var_explained <- eig / sum(eig) * 100
+
+pc1_lab <- paste0("PC1 (", round(var_explained[1], 1), "%)")
+pc2_lab <- paste0("PC2 (", round(var_explained[2], 1), "%)")
+
+
+# Extract PCs for plotting
+conditioning_vars <- scores(pca_ancestry, choices = c(1, 2), display = "sites")
+
+# Visualization
+pca_plot_df <- data.frame(conditioning_vars, Group = pheno_df$Group, Response = pheno_df$Response, Family = pheno_df$Family.lvl1)
+
+p <- ggplot(pca_plot_df, aes(x = PC1, y = PC2, color = Family, shape = Response)) + 
+  geom_point(size = 2.5, alpha = 0.8) +
+  scale_shape_manual(values = c(16, 17, 4)) +
+  labs(x = pc1_lab, 
+       y = pc2_lab) +
+  theme_minimal() +
+  theme(text = element_text(size = 12),
+        legend.title = element_text(face = "bold"),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "grey80", fill = NA, linewidth = 0.5),
+        plot.margin = unit(c(3, 1, 1, 1), "lines"),
+        legend.box.margin = margin(0, 0, 0, 0))
+
+#ggsave("PCA_LD-pruned_SNPs.png", plot=p, dpi = 500)
+
+```
+
+```{r partial_RDA, echo=FALSE}
+
+# Now we return to the full set of SNPs, all ~26,000, for the RDA...
+
+#Remove F0s and F1s.
+keep <- str_count(rownames(geno_df), "-") >= 3
+geno_matrix <- geno_df[keep, ]
+
+# Again, RDA can't handle missing values. So impute average based on ALL sequenced individuals (F0s, F1s, F2s, and back-crosses.)
+geno_matrix[] <- lapply(geno_matrix, function(x) {
+  x[is.na(x)] <- median(x, na.rm = TRUE)
+  x
+})
+
+# Make sure row orders match in both matrices
+common_ids <- intersect(rownames(geno_matrix), rownames(metadata_sub))
+geno_matrix <- geno_matrix[common_ids, ]
+pheno_df <- metadata_sub[common_ids, ]  # renamed metadata_sub to pheno_df
+
+# ==============================================================================
+# PARTIAL RDA
+# ==============================================================================
+# Model: Genotype ~ Phenotype + Family
+# Use the categorical Phenotype (h,s,c) as the predictor.
+
+Y <- geno_matrix                        # Response ("geno_matrix" is full set ~26,000 SNPs)
+X <- pheno_df$Response                  # Predictor
+Z <- pheno_df$Family.lvl1               # Condition
+
+# Run Partial RDA
+# scale=FALSE ensures emphasis on common/strongly segregating SNPs, sensible for QTL
+# scale=TRUE would give equal weight to rare alleles, which may not clearly segregate with host choice and just come from a random parent
+rda_model <- rda(Y ~ X + Condition(Z), scale = FALSE)
+
+# Summary of variance explained
+print(summary(rda_model))
+
+# Significance Test (Permutation Test)
+anova_result <- anova.cca(rda_model, permutations = 1000, parallel = 4)
+print(anova_result)
+
+# Extract eigenvalues, calculate total and constrained variance explained by each axis 
+eig <- eigenvals(rda_model)
+var_perc <- round((eig / rda_model$tot.chi) * 100, 1) #total variance
+constrained_perc <- round((eig / rda_model$CCA$tot.chi) * 100, 1) #constrained variance
+
+# Extract the scores for sites (mosquitoes) and centroids (phenotypes)
+# scaling = 3 is symmetric scaling
+sites_scores <- as.data.frame(scores(rda_model, display = "sites", scaling = 3))
+centroid_scores <- as.data.frame(scores(rda_model, display = "cn", scaling = 3))
+centroid_scores$label <- rownames(centroid_scores)
+
+# Bind the host choice column to the extracted scores dataframe.
+# Make sure the row order of 'sites_scores' matches yothe ur original dataset!
+sites_scores$Host_Pref <- metadata_sub$Response
+
+# Plot
+p <- ggplot() +
+  geom_point(data = sites_scores, aes(x = RDA1, y = RDA2, shape = Host_Pref), 
+             color = "grey60", size = 1.5, alpha = 0.7) +
+  scale_shape_manual(values = c("c" = 16, "h" = 17, "s" = 4)) +
+  geom_text_repel(data = centroid_scores, aes(x = RDA1, y = RDA2, label = label), 
+                  color = "blue", size = 5, fontface = "bold") +
+  geom_point(data = centroid_scores, aes(x = RDA1, y = RDA2), 
+             color = "blue", shape = 17, size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "darkgray") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "darkgray") +
+  theme_minimal() +
+  labs(title = "Partial RDA: Genotypes ~ Host Pref | Family",
+       x = paste0("RDA 1: ", var_perc["RDA1"], "% [", constrained_perc["RDA1"], "%]"),
+       y = paste0("RDA 2: ", var_perc["RDA2"], "% [", constrained_perc["RDA2"], "%]"))
+
+#ggsave("partialRDA_plot.png", plot=p, dpi = 500)
+
+```
+
+```{r gene_lists}
+
+# Generate clean table of all annotated genes in Cx. quinquefasciatus
+
+gff <- read.table("../../manuscript/FINAL_SUBMISSION/SUPPLEMENTARY DATA/S1_merged_chemosensory-genes_JHB2020v68.gff3",
+                  sep = "\t",
+                  comment.char = "#",
+                  quote = "",
+                  stringsAsFactors = FALSE)
+
+colnames(gff) <- c("seqid", "source", "type",
+                   "start", "end", "score",
+                   "strand", "phase", "attributes")
+
+genes <- subset(gff, type == "gene")
+genes$gene_id <- sub(".*ID=([^;]+).*", "\\1", genes$attributes)
+genes$gene_name <- sub(".*locus=([^;]+).*", "\\1", genes$attributes)
+genes$gene_description <- sub(".*description=([^;]+).*", "\\1", genes$attributes)
+
+# Now subsect by chemosensory gene families
+ORs <- genes[grepl("^(Or)", genes$gene_name),]
+OBPs <- genes[grepl("^(Obp)", genes$gene_name),]
+GRs <- genes[grepl("^(Gr)", genes$gene_name),]
+IRs <- genes[grepl("^(Ir)", genes$gene_name),]
+chemo_genes <- genes[grepl("^(Or|Obp|Gr|Ir)", genes$gene_name),]
+
+```
+
+``` {r grab_loadings, echo=FALSE}
+
+snp_scores <- scores(rda_model, choices = c(1, 2), display = "species", scaling=3)
+rda1_loadings <- snp_scores[, "RDA1"]
+rda2_loadings <- snp_scores[, "RDA2"]
+
+#--------------------------
+
+top_rda1_overall <- sort(abs(rda1_loadings), decreasing = TRUE)
+head(top_rda1_overall, 20)
+
+top_rda2_overall <- sort(abs(rda2_loadings), decreasing = TRUE)
+head(top_rda2_overall, 20)
+
+```
+
+```{r extract_RDA1_coordinates, echo=FALSE}
+# Convert to data frame
+snp_df <- as.data.frame(snp_scores)
+
+# Add SNP ID from rownames
+snp_df$SNP <- rownames(snp_df)
+
+# Rank by absolute RDA1 loading
+top1_snps <- snp_df |>
+  transform(absRDA1 = abs(RDA1)) |>
+  subset(absRDA1 >= quantile(absRDA1, 0.95)) # Top 5% of SNPs
+
+coords <- do.call(rbind, strsplit(top1_snps$SNP, ":"))
+
+top1_snps$CHROM <- coords[, 1]
+top1_snps$POS   <- as.integer(coords[, 2])
+
+window <- 171400/2 # 171400 Determined by LD decay analysis on chromosome 3 
+
+hits1 <- merge(top1_snps, genes,
+              by.x = "CHROM",
+              by.y = "seqid")
+
+nearby_genes1 <- subset(
+  hits1,
+  abs(POS - start) <= window |
+  abs(POS - end)   <= window |
+  (POS >= start - window & POS <= end + window)
+)
+
+final_hits1 <- nearby_genes1[, c(
+  "CHROM", "POS", "RDA1", "gene_id",
+  "gene_name", "gene_description", "start", "end", "strand"
+)]
+final_hits1 <- final_hits1 %>%
+  mutate(CHROM = recode(CHROM, 
+                      "CM027410.1" = "chromosome 1", 
+                      "CM027411.1" = "chromosome 2", 
+                      "CM027412.1" = "chromosome 3"))
+
+filtered_hits1 <- final_hits1 %>%
+  # Sort by gene id, then by the highest effect score
+  arrange(gene_id, desc(abs(RDA1))) %>% 
+  # Distinct will keep the version of the gene with the highest RDA score
+  distinct(gene_id, .keep_all = TRUE) %>%
+  # Re-sort by genomic position for final table
+  arrange(parse_number(CHROM), start)
+
+candidate_genes1 <- filtered_hits1[
+  grepl("^(Or|Obp|Ir|Gr)", filtered_hits1$gene_name),
+]
+
+#write.table(filtered_hits1, file="RDA1_top5%_SNPs_all_genes.txt", quote=FALSE, sep="\t")
+#write.table(candidate_genes1, file="RDA1_top5%_SNPs_chemosensory_genes.txt", quote=FALSE, sep="\t")
+```
+
+```{r extract_RDA2_coordinates, echo=FALSE}
+# Convert to data frame
+snp_df <- as.data.frame(snp_scores)
+
+# Add SNP ID from rownames
+snp_df$SNP <- rownames(snp_df)
+
+# Rank by absolute RDA2 loading
+top2_snps <- snp_df |>
+  transform(absRDA2 = abs(RDA2)) |>
+  subset(absRDA2 >= quantile(absRDA2, 0.95))
+
+coords <- do.call(rbind, strsplit(top2_snps$SNP, ":"))
+
+top2_snps$CHROM <- coords[, 1]
+top2_snps$POS   <- as.integer(coords[, 2])
+
+window <- 171400/2 # 171400 Determined by LD decay analysis on chromosome 3
+
+hits2 <- merge(top2_snps, genes,
+              by.x = "CHROM",
+              by.y = "seqid")
+
+nearby_genes2 <- subset(
+  hits2,
+  abs(POS - start) <= window |
+  abs(POS - end)   <= window |
+  (POS >= start - window & POS <= end + window)
+)
+
+final_hits2 <- nearby_genes2[, c(
+  "CHROM", "POS", "RDA2", "gene_id",
+  "gene_name", "gene_description", "start", "end", "strand"
+)]
+final_hits2 <- final_hits2 %>%
+  mutate(CHROM = recode(CHROM, 
+                      "CM027410.1" = "chromosome 1", 
+                      "CM027411.1" = "chromosome 2", 
+                      "CM027412.1" = "chromosome 3"))
+
+filtered_hits2 <- final_hits2 %>%
+  # Sort by gene id, then by the highest effect score
+  arrange(gene_id, desc(abs(RDA2))) %>% 
+  # Distinct will keep the version of the gene with the highest RDA score
+  distinct(gene_id, .keep_all = TRUE) %>%
+  # R-sort by genomic position for your final table
+  arrange(parse_number(CHROM), start)
+
+candidate_genes2 <- filtered_hits2[
+  grepl("^(Or|Obp|Ir|Gr)", filtered_hits2$gene_name),
+]
+
+#write.table(filtered_hits2, file="RDA2_top5%_SNPs_all_genes.txt", quote=FALSE, sep="\t")
+#write.table(candidate_genes2, file="RDA2_top5%_SNPs_chemosensory_genes.txt", quote=FALSE, sep="\t")
+```
+
+``` {r, compare_hets, echo=FALSE}
+ # ==============================================================================
+# Plot Genotype Percentages for Top RDA1 SNPs (comparing heterozygosity)
+# ==============================================================================
+
+# Subset the genotype matrix to only include the top 5% RDA1 SNPs
+geno_subset <- geno_matrix[, top2_snps$SNP]
+
+# Combine with phenotypes and convert to a data frame
+plot_df <- as.data.frame(geno_subset)
+plot_df$Sample <- rownames(plot_df)
+plot_df$Response <- pheno_df$Response
+
+# Reshape and Calculate Percentages
+counts_melted <- plot_df %>%
+  pivot_longer(
+    cols = -c(Sample, Response), 
+    names_to = "SNP", 
+    values_to = "Genotype"
+  ) %>%
+  # Filter out the imputed decimal values
+  filter(Genotype %in% c(0, 1, 2)) %>%
+  # Convert to factor early so all 3 categories can be tracked (0, 1, 2)
+  mutate(Genotype = factor(Genotype, levels = c(0, 1, 2))) %>%
+  # Group to count occurrences per sample
+  group_by(Sample, Response, Genotype) %>%
+  summarise(Count = n(), .groups = "drop_last") %>%
+  # Ensure samples with 0 of a specific genotype are explicitly counted as 0
+  tidyr::complete(Genotype, fill = list(Count = 0)) %>%
+  # Calculate percentage: (Genotype Count / Total Valid SNPs for that Sample) * 100
+  mutate(Percentage = (Count / sum(Count)) * 100) %>%
+  ungroup()
+
+# Plot
+ggplot(counts_melted, aes(x = Genotype, y = Percentage, fill = Response)) +
+  geom_boxplot(
+    outlier.shape = 1,  
+    outlier.size = 2,
+    alpha = 0.9
+  ) +
+  scale_fill_manual(values = c("c" = "#3274A1", "h" = "#E1812C", "s" = "#3A923A")) +
+  theme_classic() +
+  labs(
+    title = "Genotype Percentages by Response Category (Top RDA2 SNPs)",
+    x = "Genotype (0 = Hom Ref, 1 = Het, 2 = Hom Alt)",
+    y = "Percentage of Individual's SNPs (%)"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+```
+
+```{r,combine-gene-lists}
+
+merged_filtered_genes <- full_join(filtered_hits1, filtered_hits2, 
+                       by = c("CHROM", "gene_id", "gene_name", 
+                              "gene_description", "start", "end", "strand"),
+                       suffix = c("_RDA1", "_RDA2"))
+merged_filtered_genes <- merged_filtered_genes %>%
+  select(
+    CHROM, 
+    POS_RDA1, RDA1, 
+    POS_RDA2, RDA2, 
+    gene_id, gene_name, gene_description, start, end, strand
+  )
+
+#write.table(merged_filtered_genes, file="merged_top5%_SNPs_all_genes.txt", quote=FALSE, sep="\t")
+
+#----------------------------------------------------------------------------
+
+merged_chemo_genes <- full_join(candidate_genes1, candidate_genes2, 
+                       by = c("CHROM", "gene_id", "gene_name", 
+                              "gene_description", "start", "end", "strand"),
+                       suffix = c("_RDA1", "_RDA2"))
+merged_chemo_genes <- merged_chemo_genes %>%
+  select(
+    CHROM, 
+    POS_RDA1, RDA1, 
+    POS_RDA2, RDA2, 
+    gene_id, gene_name, gene_description, start, end, strand
+  )
+
+#write.table(merged_chemo_genes, file="merged_top5%_SNPs_chemosensory_genes.txt", quote=FALSE, sep="\t")
+
+#----------------------------------------------------------------------------
+bell_genes <- read.table("all_gene_olaps.txt", header=TRUE)
+
+# How many of my RDA1 genes are in Bell et al. list?
+
+search_pattern1 <- paste(c(filtered_hits1$gene_id, filtered_hits1$gene_name), collapse = "|")
+
+bell_RDA1 <- bell_genes %>%
+  filter(str_detect(V9, search_pattern1))
+
+nrow(bell_RDA1)
+
+# How many of my RDA2 genes are in Bell et al. list?
+
+search_pattern2 <- paste(c(filtered_hits2$gene_id, filtered_hits2$gene_name), collapse = "|")
+
+bell_RDA2 <- bell_genes %>%
+  filter(str_detect(V9, search_pattern2))
+
+nrow(bell_RDA2)
+
+# How many of my merged RDA1/2 genes are in Bell et al. list?
+
+search_pattern_merge <- paste(c(merged_filtered_genes$gene_id, merged_filtered_genes$gene_name), collapse = "|")
+
+bell_merged <- bell_genes %>%
+  filter(str_detect(V9, search_pattern_merge))
+
+nrow(bell_merged)
+
+# -----------------------------------------
+# NOW JUST CHEMOSENSORY!
+# -----------------------------------------
+
+# How many of my RDA1 genes are in Bell et al. list?
+
+search_pattern1_chemo <- paste(c(candidate_genes1$gene_id, candidate_genes1$gene_name), collapse = "|")
+
+bell_RDA1_chemo <- bell_genes %>%
+  filter(str_detect(V9, search_pattern1_chemo))
+
+nrow(bell_RDA1_chemo)
+
+# How many of my RDA2 genes are in Bell et al. list?
+
+search_pattern2_chemo <- paste(c(candidate_genes2$gene_id, candidate_genes2$gene_name), collapse = "|")
+
+bell_RDA2_chemo <- bell_genes %>%
+  filter(str_detect(V9, search_pattern2_chemo))
+
+nrow(bell_RDA2_chemo)
+
+# How many of my merged RDA1/2 genes are in Bell et al. list?
+
+search_pattern_mergeChemo <- paste(c(merged_chemo_genes$gene_id, merged_chemo_genes$gene_name), collapse = "|")
+
+bell_mergedChemo <- bell_genes %>%
+  filter(str_detect(V9, search_pattern_mergeChemo))
+
+nrow(bell_mergedChemo)
+
+```
+
+```{r plot_RDA_SNPs}
+
+# Bold genes that are present in both RDA1 and RDA2 sets
+shared_set <- merged_chemo_genes %>% filter(!is.na(merged_chemo_genes$RDA1)&!is.na(merged_chemo_genes$RDA2))
+unique_set <- merged_chemo_genes %>% filter(!is.na(merged_chemo_genes$RDA1)&is.na(merged_chemo_genes$RDA2))
+
+# Group genes that are within 200kb of each other -- arbitrary, just for visualization purposes
+
+clustered_uniq_labels <- unique_set %>%
+  arrange(CHROM, start) %>%
+  group_by(CHROM) %>%
+  mutate(group = cumsum(c(1, diff(start) > 200000))) %>% # 100kb threshold
+  group_by(CHROM, group) %>%
+  summarize(
+    # Collapse all gene names in the cluster into one vertical string
+    label_stack = paste(gene_name, collapse = "\n"),
+    # Point the segment to the average or peak position
+    POS = mean(as.numeric(start)),
+    RDA1 = max(RDA1),
+    .groups = 'drop'
+  )
+
+clustered_shared_labels <- shared_set %>%
+  arrange(CHROM, start) %>%
+  group_by(CHROM) %>%
+  mutate(group = cumsum(c(1, diff(start) > 200000))) %>% # 100kb threshold
+  group_by(CHROM, group) %>%
+  summarize(
+    # Collapse all gene names in the cluster into one vertical string
+    label_stack = paste(gene_name, collapse = "\n"),
+    # Point the segment to the average or peak position
+    POS = mean(as.numeric(start)),
+    RDA1 = max(RDA1),
+    .groups = 'drop'
+  )
+
+
+
+snp_df <- as.data.frame(snp_scores)
+coords <- do.call(rbind, strsplit(as.character(rownames(snp_df)), ":"))
+snp_df$CHROM <- coords[, 1]
+snp_df$POS   <- as.integer(coords[, 2])
+
+snp_df <- snp_df %>%
+  mutate(CHROM = recode(CHROM, 
+                      "CM027410.1" = "chromosome 1", 
+                      "CM027411.1" = "chromosome 2", 
+                      "CM027412.1" = "chromosome 3"))
+snp_df <- snp_df %>% filter(snp_df$CHROM != "NC_014574.1")
+
+y_limit_upper <- 1.5
+y_limit_lower <- -1.5
+
+# Define stronger repulsion variables
+h_force <- 20   # Increase from default (1) to push labels apart horizontally
+pull_strength <- 0.1 # Decrease from default (1) so they don't 'cling' to the point too much
+
+# ---------------------------------------
+# plot for Rda1
+# ---------------------------------------
+
+snp_df %>% 
+  ggplot(aes(y = RDA1, x = as.numeric(POS), color = as.factor(CHROM))) + 
+  geom_point(cex = 0.5) +
+  geom_point(data = snp_df %>% slice_max(abs(RDA1), prop = 0.05),
+             aes(y = RDA1, x = as.numeric(POS)), cex = 0.5, color= "red") + 
+  scale_color_manual(values = rep(c("grey15", "grey65"), times = 3)) + 
+
+  # POSITIVE LABELS (Top) - Combined Uniq & Shared for better dodging
+  geom_text_repel(data = rbind(subset(clustered_uniq_labels, RDA1 > 0),
+                               subset(clustered_shared_labels, RDA1 > 0)),  
+                  aes(x = POS, y = RDA1, label = label_stack, 
+                      fontface = ifelse(label_stack %in% clustered_shared_labels$label_stack, "bold.italic", "plain")), 
+                  size = 2.8, lineheight = 0.8, color = "grey30", segment.color = "grey75",
+                  
+                  nudge_y = 0.8,
+                  direction = "both",
+                  ylim = c(0.2, y_limit_upper),
+                  force = h_force,
+                  force_pull = pull_strength,
+                  box.padding = 0.5,
+                  point.padding = 0.3,
+                  
+                  min.segment.length = 0,
+                  segment.size = 0.3,
+                  max.overlaps = Inf) +
+
+  # NEGATIVE LABELS (Bottom) - Combined Uniq & Shared
+  geom_text_repel(data = rbind(subset(clustered_uniq_labels, RDA1 < 0),
+                               subset(clustered_shared_labels, RDA1 < 0)),  
+                  aes(x = POS, y = RDA1, label = label_stack,
+                      fontface = ifelse(label_stack %in% clustered_shared_labels$label_stack, "bold.italic", "plain")), 
+                  size = 2.8, lineheight = 0.8, color = "grey30", segment.color = "grey75",
+                  
+                  nudge_y = -0.8,
+                  direction = "both",
+                  ylim = c(y_limit_lower, -0.2),
+                  force = h_force,
+                  force_pull = pull_strength,
+                  box.padding = 0.5,
+                  point.padding = 0.3,
+                  
+                  min.segment.length = 0,
+                  segment.size = 0.3,
+                  max.overlaps = Inf) +
+
+  scale_y_continuous(limits = c(y_limit_lower, y_limit_upper)) +
+  labs(x = NULL) +
+  facet_wrap(~CHROM, nrow = 1, strip.position="bottom", scales = "free_x") + 
+  theme_minimal() + 
+  theme(panel.spacing = unit(0.1, "lines"), 
+        legend.position = "none",
+        axis.text.x = element_blank())
+
+```
+
+```{r}
+# Now do for RDA2
+# See comments in previous section for clarity!
+
+shared_set <- merged_chemo_genes %>% filter(!is.na(merged_chemo_genes$RDA1)&!is.na(merged_chemo_genes$RDA2))
+unique_set <- merged_chemo_genes %>% filter(is.na(merged_chemo_genes$RDA1)&!is.na(merged_chemo_genes$RDA2))
+
+clustered_uniq_labels <- unique_set %>%
+  arrange(CHROM, start) %>%
+  group_by(CHROM) %>%
+  mutate(group = cumsum(c(1, diff(start) > 200000))) %>%
+  group_by(CHROM, group) %>%
+  summarize(
+    label_stack = paste(gene_name, collapse = "\n"),
+    POS = mean(as.numeric(start)),
+    RDA2 = max(RDA2),
+    .groups = 'drop'
+  )
+
+clustered_shared_labels <- shared_set %>%
+  arrange(CHROM, start) %>%
+  group_by(CHROM) %>%
+  mutate(group = cumsum(c(1, diff(start) > 200000))) %>%
+  group_by(CHROM, group) %>%
+  summarize(
+    label_stack = paste(gene_name, collapse = "\n"),
+    POS = mean(as.numeric(start)),
+    RDA2 = max(RDA2),
+    .groups = 'drop'
+  )
+
+snp_df <- as.data.frame(snp_scores)
+coords <- do.call(rbind, strsplit(as.character(rownames(snp_df)), ":"))
+snp_df$CHROM <- coords[, 1]
+snp_df$POS   <- as.integer(coords[, 2])
+
+snp_df <- snp_df %>%
+  mutate(CHROM = recode(CHROM, 
+                      "CM027410.1" = "chromosome 1", 
+                      "CM027411.1" = "chromosome 2", 
+                      "CM027412.1" = "chromosome 3"))
+snp_df <- snp_df %>% filter(snp_df$CHROM != "NC_014574.1")
+
+y_limit_upper <- 1.5
+y_limit_lower <- -1.5
+
+h_force <- 20
+pull_strength <- 0.1
+
+# ------------------------------------
+# plot for Rda2
+# ------------------------------------
+
+snp_df %>% 
+  ggplot(aes(y = RDA2, x = as.numeric(POS), color = as.factor(CHROM))) + 
+  geom_point(cex = 0.5) +
+  geom_point(data = snp_df %>% slice_max(abs(RDA2), prop = 0.05),
+             aes(y = RDA2, x = as.numeric(POS)), cex = 0.5, color= "red") + 
+  scale_color_manual(values = rep(c("grey15", "grey65"), times = 3)) + 
+
+  # POSITIVE LABELS (Top) - Combined Uniq & Shared for better dodging
+  geom_text_repel(data = rbind(subset(clustered_uniq_labels, RDA2 > 0),
+                               subset(clustered_shared_labels, RDA2 > 0)),  
+                  aes(x = POS, y = RDA2, label = label_stack, 
+                      fontface = ifelse(label_stack %in% clustered_shared_labels$label_stack, "bold.italic", "plain")), 
+                  size = 2.8, lineheight = 0.8, color = "grey30", segment.color = "grey75",
+                  
+                  nudge_y = 0.8,
+                  direction = "both",
+                  ylim = c(0.2, y_limit_upper),
+                  force = h_force,
+                  force_pull = pull_strength,
+                  box.padding = 0.5,
+                  point.padding = 0.3,
+                  
+                  min.segment.length = 0,
+                  segment.size = 0.3,
+                  max.overlaps = Inf) +
+
+  # NEGATIVE LABELS (Bottom) - Combined Uniq & Shared
+  geom_text_repel(data = rbind(subset(clustered_uniq_labels, RDA2 < 0),
+                               subset(clustered_shared_labels, RDA2 < 0)),  
+                  aes(x = POS, y = RDA2, label = label_stack,
+                      fontface = ifelse(label_stack %in% clustered_shared_labels$label_stack, "bold.italic", "plain")), 
+                  size = 2.8, lineheight = 0.8, color = "grey30", segment.color = "grey75",
+                  
+                  nudge_y = -0.8,
+                  direction = "both",
+                  ylim = c(y_limit_lower, -0.2),
+                  force = h_force,
+                  force_pull = pull_strength,
+                  box.padding = 0.5,
+                  point.padding = 0.3,
+                  
+                  min.segment.length = 0,
+                  segment.size = 0.3,
+                  max.overlaps = Inf) +
+
+  scale_y_continuous(limits = c(y_limit_lower, y_limit_upper)) +
+  labs(x = NULL) +
+  facet_wrap(~CHROM, nrow = 1, strip.position="bottom", scales = "free_x") + 
+  theme_minimal() + 
+  theme(panel.spacing = unit(0.1, "lines"), 
+        legend.position = "none",
+        axis.text.x = element_blank())
+
+```
+
+```{r, extract_gene_ranges}
+
+# OR, Obp, Ir, and Gr Genes GRanges
+ORs_gr <- GRanges(seqnames = as.character(ORs$seqid), 
+                  ranges = IRanges(start = ORs$start, end = ORs$end))
+
+OBPs_gr <- GRanges(seqnames = as.character(OBPs$seqid), 
+                  ranges = IRanges(start = OBPs$start, end = OBPs$end))
+
+IRs_gr <- GRanges(seqnames = as.character(IRs$seqid), 
+                  ranges = IRanges(start = IRs$start, end = IRs$end))
+
+GRs_gr <- GRanges(seqnames = as.character(GRs$seqid), 
+                  ranges = IRanges(start = GRs$start, end = GRs$end))
+
+# All chemosensory and all gene GRanges
+chemo_gr <- GRanges(seqnames = as.character(chemo_genes$seqid), 
+                  ranges = IRanges(start = chemo_genes$start, end = chemo_genes$end))
+
+all_genes_gr <- GRanges(seqnames = as.character(genes$seqid), 
+                        ranges = IRanges(start = genes$start, end = genes$end))
+
+# Top RDA1 SNPs GRanges
+top1_snps_gr <- GRanges(seqnames = top1_snps$CHROM, 
+                        ranges = IRanges(start = top1_snps$POS, end = top1_snps$POS))
+
+# Top RDA2 SNPs GRanges
+top2_snps_gr <- GRanges(seqnames = as.character(top2_snps$CHROM), 
+                        ranges = IRanges(start = top2_snps$POS, end = top2_snps$POS))
+```
+
+
+```{r}
+
+#------------------------------------------------------------------------------
+# RDA1 (host fidelity) ANALYSIS: ALL CHEMOSENSORY GENES
+#------------------------------------------------------------------------------
+
+# --- OBSERVED PROPORTION ---
+# Get unique OR genes within 171.4kb
+obs_chemo_hits <- subsetByOverlaps(chemo_gr, top1_snps_gr + (171400/2))
+# Get unique TOTAL genes within 171.4kb
+obs_total_hits <- subsetByOverlaps(all_genes_gr, top1_snps_gr + (171400/2))
+
+# Calculate Observed Proportion
+observed_prop <- length(unique(obs_chemo_hits)) / length(unique(obs_total_hits))
+
+# --- PERMUTATION LOOP ---
+all_snp_names <- colnames(geno_df)[-1] 
+n_permutations <- 1000
+null_props <- numeric(n_permutations)
+n_top1_snps <- nrow(top1_snps)
+
+for(i in 1:n_permutations) {
+  # Sample random SNPs
+  random_snp_subset <- sample(all_snp_names, n_top1_snps)
+  
+  # Extract coordinates
+  random_snps_info <- data.frame(snp_id = random_snp_subset) %>%
+    separate(snp_id, into = c("chr", "pos"), sep = ":", convert = TRUE)
+  
+  # Convert to GRanges
+  random_gr <- GRanges(seqnames = as.character(random_snps_info$chr), 
+                       ranges = IRanges(start = random_snps_info$pos, 
+                                        end = random_snps_info$pos))
+  
+  # Calculate Proportion for this random set
+  # Count unique ORs
+  rand_chemo_hits <- subsetByOverlaps(chemo_gr, random_gr + (171400/2))
+  # Count unique TOTAL genes
+  rand_total_hits <- subsetByOverlaps(all_genes_gr, random_gr + (171400/2))
+  
+  # Store the proportion
+  total_count <- length(unique(rand_total_hits))
+  if(total_count > 0){
+    null_props[i] <- length(unique(rand_chemo_hits)) / total_count
+  } else {
+    null_props[i] <- 0
+  }
+}
+
+# --- STATS & PLOTTING ---
+p_value <- (sum(null_props <= observed_prop)) / (n_permutations)
+
+hist(null_props, main="Permutation Test: Proportion of Chemosensory Genes (RDA1)", 
+     xlab="Proportion (Chemosensory / Total Genes)", 
+     col="lightgrey", border="white")
+abline(v = observed_prop, col="red", lwd=2, lty=2)
+
+```
+
+```{r}
+
+#------------------------------------------------------------------------------
+# RDA2 (host preference) ANALYSIS: ALL CHEMOSENSORY GENES
+#------------------------------------------------------------------------------
+
+# --- OBSERVED PROPORTION ---
+# Get unique OR genes within 100kb
+obs_chemo_hits <- subsetByOverlaps(chemo_gr, top2_snps_gr + (171400/2))
+# Get unique TOTAL genes within 100kb
+obs_total_hits <- subsetByOverlaps(all_genes_gr, top2_snps_gr + (171400/2))
+
+# Calculate Observed Proportion
+observed_prop <- length(unique(obs_chemo_hits)) / length(unique(obs_total_hits))
+
+# --- PERMUTATION LOOP ---
+all_snp_names <- colnames(geno_df)[-1] 
+n_permutations <- 1000
+null_props <- numeric(n_permutations)
+n_top2_snps <- nrow(top2_snps)
+
+for(i in 1:n_permutations) {
+  # Sample random SNPs
+  random_snp_subset <- sample(all_snp_names, n_top2_snps)
+  
+  # Extract coordinates
+  random_snps_info <- data.frame(snp_id = random_snp_subset) %>%
+    separate(snp_id, into = c("chr", "pos"), sep = ":", convert = TRUE)
+  
+  # Convert to GRanges
+  random_gr <- GRanges(seqnames = as.character(random_snps_info$chr), 
+                       ranges = IRanges(start = random_snps_info$pos, 
+                                        end = random_snps_info$pos))
+  
+  # 4. Calculate Proportion for this random set
+  # Count unique ORs
+  rand_chemo_hits <- subsetByOverlaps(chemo_gr, random_gr + (171400/2))
+  # Count unique TOTAL genes
+  rand_total_hits <- subsetByOverlaps(all_genes_gr, random_gr + (171400/2))
+  
+  # Store the proportion
+  total_count <- length(unique(rand_total_hits))
+  if(total_count > 0){
+    null_props[i] <- length(unique(rand_chemo_hits)) / total_count
+  } else {
+    null_props[i] <- 0
+  }
+}
+
+# --- STATS & PLOTTING ---
+p_value <- (sum(null_props <= observed_prop)) / (n_permutations)
+
+hist(null_props, main="Permutation Test: Proportion of Chemosensory Genes (RDA2)", 
+     xlab="Proportion (Chemosensory / Total Genes in 100kb Windows)", 
+     col="lightgrey", border="white")
+abline(v = observed_prop, col="red", lwd=2, lty=2)
+
+```

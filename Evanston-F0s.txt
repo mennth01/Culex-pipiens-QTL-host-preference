@@ -1,0 +1,10 @@
+E003B.sorted.bam
+E006A.sorted.bam
+E006D.sorted.bam
+E009D.sorted.bam
+E012A.sorted.bam
+E021D.sorted.bam
+C005.sorted.bam
+C010.sorted.bam
+C020.sorted.bam
+C026.sorted.bam

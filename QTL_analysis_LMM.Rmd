@@ -1,0 +1,316 @@
+```{r}
+library(tidyverse)
+library(ggrepel)
+
+setwd("C:/Users/Theresa Menna/Documents/Fritz Lab/QTL/scripts_from_kate/")
+
+theme_set(theme_bw(base_size=12))
+theme_update(panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(), 
+  plot.title = element_text(),
+  axis.text.x = element_blank(),
+  axis.ticks.x = element_blank(),
+  panel.spacing = unit(0, "lines"),
+  strip.background = element_blank(),
+  panel.border = element_blank(),
+  legend.position = "none", 
+  strip.text.x = element_text(margin = margin(0,0,0,0, "cm")))
+```
+
+```{r}
+results <- read.table("./LMM-hostprefQTL-QuinqsT.assoc.txt", header = T) %>% 
+  filter(af > 0.05) # keep only SNPs where allele frequency > 5%
+results <- results[which(results$chr!="NC_014574.1"),] # remove some SNPs found on extra-chromosomal scaffold
+results <- results %>% mutate(p_lrt_BH = p.adjust(p_lrt, method = "BH", n = length(results$p_lrt))) #p-value adjustment
+results_chromName <- results %>%
+  mutate(chr = recode(chr, 
+                      "CM027410.1" = "chromosome 1", 
+                      "CM027411.1" = "chromosome 2", 
+                      "CM027412.1" = "chromosome 3"))
+
+p <- results_chromName %>% 
+  ggplot(aes(y = -log10(p_lrt), x = as.numeric(ps), color = as.factor(chr))) +
+  geom_point(cex = 0.5) +
+  scale_color_manual(values = rep(c("grey15", "grey65"), times = 3)) +
+  geom_point(data = results_chromName %>% 
+               filter(p_lrt_BH < 0.05),
+             aes(y = -log10(p_lrt), x = as.numeric(ps)), cex = 1.5, color= "red") +
+  labs(x = NULL, y = expression(-log[10](italic(p)-value))) + 
+  facet_wrap(~chr, nrow = 1, strip.position="bottom", scales = "free_x") +
+  theme(text=element_text(size=14)) 
+
+ggsave("GEMMA_full_manhattan.png", plot=p, dpi = 500)
+
+print_top_snps <- results_chromName %>% filter(p_lrt_BH < 0.05)
+#write.table(print_top_snps, file="hostprefQTL_signifcantSNPs.txt", quote=FALSE, sep="\t")
+
+top_snps <- results %>% filter(p_lrt_BH < 0.05)
+
+```
+
+```{r}
+
+gff <- read.table("../../manuscript/FINAL_SUBMISSION/SUPPLEMENTARY DATA/S1_merged_chemosensory-genes_JHB2020v68.gff3",
+                  sep = "\t",
+                  comment.char = "#",
+                  quote = "",
+                  stringsAsFactors = FALSE)
+
+colnames(gff) <- c("seqid", "source", "type",
+                   "start", "end", "score",
+                   "strand", "phase", "attributes")
+
+genes <- subset(gff, type == "gene")
+genes$gene_id <- sub(".*ID=([^;]+).*", "\\1", genes$attributes)
+genes$gene_name <- sub(".*locus=([^;]+).*", "\\1", genes$attributes)
+genes$gene_description <- sub(".*description=([^;]+).*", "\\1", genes$attributes)
+
+window <- 171400/2 # 171.4kb came from LD decay analysis on chromosome 3
+
+hits <- merge(top_snps, genes,
+              by.x = "chr",
+              by.y = "seqid")
+
+nearby_genes <- subset(
+  hits,
+  abs(ps - start) <= window |
+  abs(ps - end)   <= window |
+  (ps >= start - window & ps <= end + window)
+)
+
+final_hits <- nearby_genes[, c(
+  "chr", "ps", "n_mis", "n_obs", "allele1", "allele0", "af", "beta", "se", "p_lrt_BH", 
+  "gene_name", "gene_id", "gene_description", "start", "end", "strand"
+)]
+final_hits <- final_hits %>%
+  mutate(chr = recode(chr, 
+                      "CM027410.1" = "chromosome 1", 
+                      "CM027411.1" = "chromosome 2", 
+                      "CM027412.1" = "chromosome 3"))
+
+filtered_hits <- final_hits %>%
+  # Sort by gene name, then by the highest effect score
+  arrange(gene_id, desc(beta)) %>% 
+  # Distinct will keep the version of the gene with the best beta
+  distinct(gene_id, .keep_all = TRUE) %>%
+  # Re-sort by genomic position for your final table
+  arrange(parse_number(chr), start)
+
+candidate_genes <- filtered_hits[
+  grepl("^(Or|Obp|Ir|Gr)", filtered_hits$gene_name),
+]
+
+#write.table(filtered_hits, file="hostprefQTL_171400bp-window_all-genes.txt", quote=FALSE, sep="\t")
+#write.table(candidate_genes, file="hostprefQTL_171400bp-window_chemosensory-genes.txt", quote=FALSE, sep="\t")
+
+```
+
+```{r}
+
+# Identify the specific row for Ir179 to give it special formatting
+ir179_data <- candidate_genes %>% filter(gene_name == "Ir179")
+other_genes <- candidate_genes %>% filter(gene_name != "Ir179")
+
+results_chr3 <- results_chromName %>% filter(chr == "chromosome 3")
+
+p <- results_chr3 %>%
+  ggplot(aes(y = -log10(p_lrt), x = as.numeric(ps), color = as.factor(chr))) +
+  geom_point(cex = 0.5) +
+  scale_color_manual(values = rep(c("grey15", "grey65"), times = 3)) +
+  
+  # LABEL 1: The 8 other chemosensory genes
+  geom_text_repel(data = other_genes, 
+                aes(x = as.numeric(start), y = -log10(p_lrt_BH), label = gene_name),
+                color = "grey50", size = 3, fontface = "bold.italic",
+                box.padding = 0.5, 
+                point.padding = 0.2,
+                min.segment.length = 0, 
+                force = 10,           # Increase force to help vertical stacking
+                nudge_y = 6,      # LOCK X-AXIS POSITION
+                segment.color = "grey70") +
+
+  # LABEL 2: Ir179 at the peak
+  geom_label_repel(data = ir179_data, 
+                 aes(x = as.numeric(start), y = -log10(p_lrt_BH), label = gene_name),
+                 color = "white", fill = "firebrick", fontface = "bold.italic",
+                 size = 3.5, box.padding = 1, point.padding = 0.2,
+                 arrow = arrow(length = unit(0.02, "npc")),
+                 segment.color = NA,
+                 nudge_y = 4.4,         # Start it higher to stay at the summit
+                 ) +     # LOCK X-AXIS POSITION
+  
+    # Highlight all significant points in red
+  geom_point(data = results_chr3 %>% filter(p_lrt_BH < 0.05),
+             aes(y = -log10(p_lrt), x = as.numeric(ps)), cex = 1.5, color= "red") +
+  
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) +
+  
+  labs(x = NULL, y = expression(-log[10](italic(p)-value))) + 
+  facet_wrap(~chr, nrow = 1, strip.position="bottom", scales = "free_x") +
+  theme_minimal() +
+  theme(text=element_text(size=14),
+        panel.spacing = unit(0.1, "lines"),
+        legend.position = "none",
+        panel.grid.minor = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+#ggsave("GEMMA_chr3_manhattan.png", plot=p, dpi = 500)
+
+
+```
+
+```{r}
+
+#Read in genotypes for the position at QTL peak
+genotypes <- read.table("./genotype_per_sample.tsv", header = FALSE)
+colnames(genotypes) <- c("SAMPLE", "GT")
+
+#Read in list of identities of BG1 F0s, AG2 F0s, and F2s
+F2s <- read.table("./filtered_sorted_bams_F2only.txt", header = FALSE)
+F2s <- F2s$V1
+
+#Sort rows from "genotypes" to create BG1 F0, AG2 F0, and F2 tables.
+#Do not include rows/samples for which genotype is missing at this locus!
+F2s_GT <- genotypes[which(genotypes$SAMPLE %in% F2s),] %>% na.omit() #This one is not really needed.
+
+phen <- read.table("./all_phenotype.sorted.bam.txt", header = FALSE)
+colnames(phen) <- c("TYPE", "SAMPLE", "PHEN")
+
+F2s_phen <- merge(F2s_GT,phen,by.x = "SAMPLE")
+F2s_phen$GT <- replace(F2s_phen$GT, F2s_phen$GT == "0/0", 0)
+F2s_phen$GT <- replace(F2s_phen$GT, F2s_phen$GT == "0/1", 1)
+F2s_phen$GT <- replace(F2s_phen$GT, F2s_phen$GT == "1/1", 2)
+F2s_phen$PHEN <- replace(F2s_phen$PHEN, F2s_phen$PHEN == 1, "Human-choosing")
+F2s_phen$PHEN <- replace(F2s_phen$PHEN, F2s_phen$PHEN == 2, "Switcher")
+F2s_phen$PHEN <- replace(F2s_phen$PHEN, F2s_phen$PHEN == 3, "Avian-choosing")
+F2s_phen <- F2s_phen %>% mutate(GROUP = ifelse(grepl("BcEV", SAMPLE), "BCs", "F2s"))  
+
+
+desired_order <- c("Avian-choosing", "Switcher", "Human-choosing")
+F2s_phen$PHEN <- factor(F2s_phen$PHEN, levels = desired_order)
+
+
+F2_plot <- ggplot(F2s_phen, aes(x = as.numeric(GT), y = PHEN, fill = PHEN)) +
+  geom_violin(trim = FALSE) +
+  geom_jitter(aes(shape = GROUP, color = PHEN), size = 3, width = 0.1, alpha = 0.5) +  
+    labs(x = expression(bold("no. of alternate alleles")),
+       y = NULL) +
+  guides(fill = "none", color = "none") +
+  
+  theme_minimal() + 
+  scale_x_continuous(breaks = 0:2) + 
+  scale_fill_manual(values = c("lightblue", "lavender", "lightpink")) + 
+  scale_color_manual(values = c("blue", 'purple', "red")) +
+  theme(
+    text = element_text(size = 14),
+    axis.title.x = element_text(face = "bold"),
+    axis.text = element_text(color = "black"),
+    legend.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+F2_plot
+#ggsave("QTL_genotype_distribution.png", plot=F2_plot, dpi = 500)
+
+
+```
+
+```{r GT_extraction, echo=FALSE}
+
+# This section is for spot-checking genotype distributions for interesting SNPs found
+# in the partial RDA analysis. Very similar to the above block of code.
+
+# Read in vcf and create unique loci IDs "CHROM:POS"
+vcf <- read.vcfR("./hostprefQTL-QuinqsT.filtered-variants.vcf.recode.vcf")
+locus_ids <- paste(
+  vcf@fix[,"CHROM"],
+  vcf@fix[,"POS"],
+  sep = ":"
+)
+
+#Read in metadata
+metadata <- read.csv("QTL_metadata.csv",row.names = 1, header=TRUE, sep=",")
+keep <- str_count(rownames(metadata), "-") >= 3
+metadata_sub <- metadata[keep, ]
+
+# Extract just GT strings and change to pseudo allele counts
+gt <- extract.gt(vcf, element = "GT")
+
+gt_num <- matrix(NA_real_, nrow=nrow(gt), ncol=ncol(gt))
+
+gt_num[gt == "0/0"] <- 0
+gt_num[gt %in% c("0/1", "1/0")] <- 1
+gt_num[gt == "1/1"] <- 2
+
+# Transform to row = individuals, cols = loci
+geno_mat <- t(gt_num)
+
+# Name rows and cols correctly
+colnames(geno_mat) <- locus_ids
+rownames(geno_mat) <- colnames(gt)
+
+geno_df <- data.frame(
+  geno_mat,
+  check.names = FALSE
+)
+
+keep <- str_count(rownames(geno_df), "-") >= 3
+geno_matrix <- geno_df[keep, ]
+
+# CHANGE THIS FOR DIFFERENT SNPs!
+genotypes <- geno_matrix[,grep("CM027412.1:117545454", colnames(geno_matrix))]
+
+df <- cbind(metadata_sub, genotypes)
+
+desired_order <- c("c", "s", "h")
+df$Response <- factor(df$Response, levels = desired_order)
+
+
+df_plot <- ggplot(df, aes(x = as.numeric(genotypes), y = Response, fill = Response)) +
+  geom_violin(trim = FALSE) +
+  geom_jitter(aes(shape = Group, color = Response), size = 3, width = 0.1, alpha = 0.5) +  
+  labs(x = expression(bold("no. of alternate alleles")),
+       y = NULL) +
+  guides(fill = "none", color = "none") +
+  
+  theme_minimal() + 
+  scale_x_continuous(breaks = 0:2) + 
+  scale_fill_manual(values = c("lightblue", "lavender", "lightpink")) + 
+  scale_color_manual(values = c("blue", 'purple', "red")) +
+  theme(
+    text = element_text(size = 14),
+    axis.title.x = element_text(face = "bold"),
+    axis.text = element_text(color = "black"),
+    legend.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+df_plot
+```
+> top_rda1_overall <- sort(abs(rda1_loadings), decreasing = TRUE)
+> head(top_rda1_overall, 20)
+CM027411.1:223919852 CM027411.1:223912549 CM027411.1:223912582 CM027411.1:223912584 CM027411.1:223912594 CM027411.1:223912630 
+           0.3194492            0.2663728            0.2663728            0.2663728            0.2663728            0.2663728 
+ CM027411.1:24285505 CM027411.1:118469373 CM027411.1:186662215 CM027411.1:186662227  CM027411.1:86916215 CM027411.1:118469195 
+           0.2557519            0.2543214            0.2518499            0.2518499            0.2477467            0.2472097 
+ CM027410.1:93125209  CM027410.1:79658361    CM027410.1:110288 CM027411.1:208631415 CM027411.1:223912564  CM027412.1:13458033 
+           0.2447036            0.2437553            0.2421928            0.2386377            0.2372693            0.2364487 
+CM027412.1:117545454    CM027410.1:462923 
+           0.2345299            0.2335674 
+> top_rda2_overall <- sort(abs(rda2_loadings), decreasing = TRUE)
+> head(top_rda2_overall, 20)
+CM027411.1:149161900 CM027411.1:149161977 CM027411.1:149161981 CM027411.1:149161918  CM027410.1:10260719  CM027410.1:10260728 
+           0.2661188            0.2661188            0.2661188            0.2541419            0.2344860            0.2325007 
+CM027411.1:153835380 CM027412.1:171824392  CM027410.1:10260718  CM027412.1:80782164  CM027412.1:82324021  CM027412.1:82324037 
+           0.2234759            0.2229851            0.2194863            0.2166796            0.2071247            0.2071247 
+ CM027410.1:54161001 CM027412.1:104798657 CM027411.1:224868965 CM027411.1:107132213  CM027412.1:82324031 CM027412.1:171824393 
+           0.2054289            0.2048588            0.2032162            0.2007568            0.2005838            0.2005423 
+ CM027411.1:89298259  CM027411.1:89298271 
+           0.2004249            0.2004249
+
+
+
+
+
+

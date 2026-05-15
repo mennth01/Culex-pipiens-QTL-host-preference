@@ -1,0 +1,27 @@
+##
+## GEMMA Version    = 0.98.5 (2021-08-25)
+## Build profile    = /gnu/store/8rvid272yb53bgascf5c468z0jhsyflj-profile
+## GCC version      = 13.3.0
+## GSL Version      = 2.8
+## OpenBlas         = OpenBLAS 0.3.29  - OpenBLAS 0.3.27 DYNAMIC_ARCH NO_AFFINITY SkylakeX MAX_THREADS=128
+##   arch           = SkylakeX
+##   threads        = 1
+##   parallel type  = threaded
+##
+## Command Line Input = /nfshomes/tmenna/miniconda3/envs/tmenna_env1/bin/gemma -bfile ./hostprefQTL-QuinqsT_offspring_gemma -lm 4 -o LMM-hostprefQTL-QuinqsT 
+##
+## Date = Thu Jan  1 21:26:47 2026
+##
+## Summary Statistics:
+## number of total individuals = 104
+## number of analyzed individuals = 104
+## number of covariates = 1
+## number of phenotypes = 1
+## number of total SNPs/var = 26099
+## number of analyzed SNPs/var = 6782
+##
+## Computation Time:
+## total computation time = 0.00276172 min 
+## computation time break down: 
+##      time on optimization = 0.000332233 min 
+##
