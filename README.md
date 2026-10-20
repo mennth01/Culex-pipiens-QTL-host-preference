@@ -1,12 +1,12 @@
 # Culex-pipiens-QTL-host-preference
-Raw sequencing reads processed with:
+- Raw sequencing reads processed with:
   1. Demult.sh -- barcodes found in 4 files <Idx1_barcodes.C-fixed.tsv> <Idxs_barcodes.C-fixed.tsv> <Idx6_barcodes.C-fixed.tsv> and <Idx12_barcodes.C-fixed.tsv>
   2. Trimmomatic.sh -- with custom adaptor file for trimming <TruSeq3-PE-2_prefixTTA.fa>
   3. Map_Reads.sh -- with bowtie2
   4. Sort_Bams.sh
-Genotypes called using "Call_Genotypes.sh"
-Output formatted for GEMMA with "Setup_for_Gemma.sh"
-QTL analysis run with Gemma.sh -- (Output is "LMM-hostprefQTL-QuinqsT.assoc.txt")
+- Genotypes called using "Call_Genotypes.sh"
+- Output formatted for GEMMA with "Setup_for_Gemma.sh"
+- QTL analysis run with Gemma.sh -- (Output is "LMM-hostprefQTL-QuinqsT.assoc.txt")
 
 * Behavioral Analysis: "behavioral_analysis.Rmd"
 * QTL summary and analysis of GEMMA output: "QTL_analysis_LMM.Rmd"
